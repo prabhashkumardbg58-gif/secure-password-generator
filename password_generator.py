@@ -9,8 +9,10 @@ import base64
 import os
 import json
 import csv
+import time
 import qrcode
 from PIL import ImageTk
+import pyotp
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
@@ -28,7 +30,6 @@ VAULT_FILE = "vault.enc"
 VAULT_SALT_FILE = "vault.salt"
 
 class QuantumVault:
-    """Handles AES-256 encrypted storage using Fernet."""
     @staticmethod
     def _get_fernet_key(master_pwd: str, salt: bytes) -> bytes:
         kdf = PBKDF2HMAC(
@@ -52,7 +53,7 @@ class QuantumVault:
                 decrypted = fernet.decrypt(f.read())
             return json.loads(decrypted.decode())
         except Exception:
-            raise ValueError("Invalid Master Password or corrupted vault file.")
+            raise ValueError("Invalid Master Password or corrupted vault.")
 
     @classmethod
     def save_vault(cls, master_pwd: str, data: dict):
@@ -75,15 +76,35 @@ class QuantumPassApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("QUANTUM SECURE PASS - Ultimate Edition")
-        self.geometry("740x840")
+        self.title("QUANTUM SECURE PASS - Enterprise Edition")
+        self.geometry("780x880")
         self.resizable(False, False)
         self.configure(fg_color="#0b0f19")
 
         self.history = []
+        self.vault_cache = {}
+        self.totp_secrets = {}
         self.qr_window = None
+        self.last_activity = time.time()
 
         self.create_tabview()
+        self.bind_events()
+        self.check_auto_lock()
+        self.update_totp_loop()
+
+    def bind_events(self):
+        self.bind_all("<Key>", lambda e: self.reset_timer())
+        self.bind_all("<Button-1>", lambda e: self.reset_timer())
+
+    def reset_timer(self):
+        self.last_activity = time.time()
+
+    def check_auto_lock(self):
+        if getattr(self, "vault_unlocked", False):
+            if time.time() - self.last_activity > 180:
+                self.lock_vault()
+                messagebox.showwarning("Auto-Lock", "Vault locked automatically due to 3 minutes of inactivity.")
+        self.after(5000, self.check_auto_lock)
 
     def create_tabview(self):
         self.tabs = ctk.CTkTabview(self, fg_color="#101622", segmented_button_selected_color="#6c5ce7")
@@ -91,13 +112,15 @@ class QuantumPassApp(ctk.CTk):
 
         self.tab_generator = self.tabs.add("Generator")
         self.tab_vault = self.tabs.add("Encrypted Vault")
+        self.tab_totp = self.tabs.add("2FA Authenticator")
         self.tab_bulk = self.tabs.add("Bulk Export")
 
         self.setup_generator_ui()
         self.setup_vault_ui()
+        self.setup_totp_ui()
         self.setup_bulk_ui()
 
-    # --- Generator UI ---
+    # --- Tab 1: Generator UI ---
     def setup_generator_ui(self):
         self.header = ctk.CTkLabel(
             self.tab_generator, text="⚡ QUANTUM GENERATOR", 
@@ -142,7 +165,6 @@ class QuantumPassApp(ctk.CTk):
         )
         self.generate_btn.pack(pady=8, padx=20, fill="x")
 
-        # Action Strip
         self.btn_grid = ctk.CTkFrame(self.tab_generator, fg_color="transparent")
         self.btn_grid.pack(pady=2, padx=20, fill="x")
 
@@ -155,7 +177,6 @@ class QuantumPassApp(ctk.CTk):
         self.qr_btn = ctk.CTkButton(self.btn_grid, text="📱 Show QR", command=self.show_qr_code, fg_color="#2ed573", text_color="#050811", width=120)
         self.qr_btn.pack(side="left", padx=2, expand=True, fill="x")
 
-        # Controls
         self.controls = ctk.CTkFrame(self.tab_generator, fg_color="#161b22", corner_radius=10)
         self.controls.pack(pady=8, padx=20, fill="x")
 
@@ -184,38 +205,63 @@ class QuantumPassApp(ctk.CTk):
         self.ambig_switch = ctk.CTkSwitch(self.switches_frame, text="No Ambiguous (0,O,l,1)")
         self.ambig_switch.grid(row=1, column=1, padx=10, pady=2, sticky="w")
 
-        # Rolling Session History
-        self.history_box = ctk.CTkTextbox(self.tab_generator, height=60, fg_color="#0b0f19", text_color="#a29bfe", font=ctk.CTkFont(family="Consolas", size=11))
+        self.history_box = ctk.CTkTextbox(self.tab_generator, height=55, fg_color="#0b0f19", text_color="#a29bfe", font=ctk.CTkFont(family="Consolas", size=11))
         self.history_box.pack(pady=6, padx=20, fill="x")
         self.history_box.configure(state="disabled")
 
-    # --- Encrypted Vault UI ---
+    # --- Tab 2: Encrypted Vault with Search & Health Audit ---
     def setup_vault_ui(self):
-        self.master_pwd_entry = ctk.CTkEntry(self.tab_vault, placeholder_text="Master Vault Password", show="*", width=250)
-        self.master_pwd_entry.pack(pady=(15, 6))
+        self.vault_unlocked = False
 
-        self.vault_actions = ctk.CTkFrame(self.tab_vault, fg_color="transparent")
-        self.vault_actions.pack(pady=4)
+        self.vault_top = ctk.CTkFrame(self.tab_vault, fg_color="transparent")
+        self.vault_top.pack(pady=6, padx=10, fill="x")
 
-        ctk.CTkButton(self.vault_actions, text="Unlock / Load", command=self.load_vault_entries, fg_color="#6c5ce7").pack(side="left", padx=5)
-        ctk.CTkButton(self.vault_actions, text="Lock Vault", command=self.lock_vault, fg_color="#eb4d4b").pack(side="left", padx=5)
+        self.master_pwd_entry = ctk.CTkEntry(self.vault_top, placeholder_text="Master Vault Password", show="*", width=200)
+        self.master_pwd_entry.pack(side="left", padx=4)
+
+        ctk.CTkButton(self.vault_top, text="Unlock", command=self.load_vault_entries, fg_color="#6c5ce7", width=75).pack(side="left", padx=3)
+        ctk.CTkButton(self.vault_top, text="Lock", command=self.lock_vault, fg_color="#eb4d4b", width=75).pack(side="left", padx=3)
+        ctk.CTkButton(self.vault_top, text="Audit Health", command=self.run_vault_audit, fg_color="#f39c12", text_color="#050811", width=95).pack(side="left", padx=3)
+
+        self.search_entry = ctk.CTkEntry(self.tab_vault, placeholder_text="🔍 Live search accounts...")
+        self.search_entry.pack(pady=4, padx=15, fill="x")
+        self.search_entry.bind("<KeyRelease>", self.filter_vault_display)
 
         self.save_form = ctk.CTkFrame(self.tab_vault, fg_color="#161b22", corner_radius=10)
-        self.save_form.pack(pady=10, padx=20, fill="x")
+        self.save_form.pack(pady=6, padx=15, fill="x")
 
-        self.vault_acc_entry = ctk.CTkEntry(self.save_form, placeholder_text="Account/Service (e.g., GitHub, Gmail)")
-        self.vault_acc_entry.pack(pady=4, padx=15, fill="x")
+        self.vault_acc_entry = ctk.CTkEntry(self.save_form, placeholder_text="Account/Service (e.g. GitHub)")
+        self.vault_acc_entry.pack(pady=3, padx=10, fill="x")
 
         self.vault_pass_entry = ctk.CTkEntry(self.save_form, placeholder_text="Password to Store")
-        self.vault_pass_entry.pack(pady=4, padx=15, fill="x")
+        self.vault_pass_entry.pack(pady=3, padx=10, fill="x")
 
-        ctk.CTkButton(self.save_form, text="Save Entry to Vault", command=self.save_vault_entry, fg_color="#00e5ff", text_color="#050811").pack(pady=8)
+        ctk.CTkButton(self.save_form, text="Save Entry to Vault", command=self.save_vault_entry, fg_color="#00e5ff", text_color="#050811").pack(pady=6)
 
-        self.vault_list = ctk.CTkTextbox(self.tab_vault, height=220, fg_color="#0b0f19", font=ctk.CTkFont(family="Consolas", size=12))
-        self.vault_list.pack(pady=8, padx=20, fill="both", expand=True)
+        self.vault_list = ctk.CTkTextbox(self.tab_vault, height=180, fg_color="#0b0f19", font=ctk.CTkFont(family="Consolas", size=11))
+        self.vault_list.pack(pady=4, padx=15, fill="both", expand=True)
         self.vault_list.configure(state="disabled")
 
-    # --- Bulk Export UI ---
+    # --- Tab 3: Built-in 2FA / TOTP Authenticator UI ---
+    def setup_totp_ui(self):
+        ctk.CTkLabel(self.tab_totp, text="🔑 2FA Authenticator (TOTP)", font=ctk.CTkFont(size=16, weight="bold"), text_color="#00f0ff").pack(pady=(12, 6))
+
+        self.totp_form = ctk.CTkFrame(self.tab_totp, fg_color="#161b22", corner_radius=10)
+        self.totp_form.pack(pady=6, padx=20, fill="x")
+
+        self.totp_name_entry = ctk.CTkEntry(self.totp_form, placeholder_text="Account Label (e.g. Google, Discord)")
+        self.totp_name_entry.pack(pady=4, padx=15, fill="x")
+
+        self.totp_secret_entry = ctk.CTkEntry(self.totp_form, placeholder_text="Base32 Secret Key (e.g. JBSWY3DPEHPK3PXP)")
+        self.totp_secret_entry.pack(pady=4, padx=15, fill="x")
+
+        ctk.CTkButton(self.totp_form, text="Add 2FA Key", command=self.add_totp_key, fg_color="#2ed573", text_color="#050811").pack(pady=6)
+
+        self.totp_display = ctk.CTkTextbox(self.tab_totp, height=220, fg_color="#0b0f19", font=ctk.CTkFont(family="Consolas", size=13))
+        self.totp_display.pack(pady=6, padx=20, fill="both", expand=True)
+        self.totp_display.configure(state="disabled")
+
+    # --- Tab 4: Bulk Export UI ---
     def setup_bulk_ui(self):
         ctk.CTkLabel(self.tab_bulk, text="📦 Bulk Password Exporter", font=ctk.CTkFont(size=16, weight="bold"), text_color="#00f0ff").pack(pady=(20, 10))
 
@@ -228,7 +274,7 @@ class QuantumPassApp(ctk.CTk):
 
         ctk.CTkButton(self.tab_bulk, text="Generate & Export to CSV", command=self.export_csv, fg_color="#2ed573", text_color="#050811", height=40).pack(pady=20, padx=40, fill="x")
 
-    # --- Core Mechanics & Generator Logic ---
+    # --- Generator Engine & Telemetry ---
     def update_length_label(self, val):
         unit = "WORDS" if self.mode_var.get() == "Passphrase" else "LENGTH"
         self.length_label.configure(text=f"{unit}: {int(val)}")
@@ -310,13 +356,8 @@ class QuantumPassApp(ctk.CTk):
             self.clipboard_clear()
             self.clipboard_append(pwd)
             self.copy_btn.configure(text="✅ Copied (30s)")
-            self.after(30000, self.auto_clear_clipboard)
+            self.after(30000, lambda: self.copy_btn.configure(text="📋 Copy"))
 
-    def auto_clear_clipboard(self):
-        self.clipboard_clear()
-        self.copy_btn.configure(text="📋 Copy")
-
-    # --- Feature 1: HaveIBeenPwned API (k-Anonymity) ---
     def check_pwned_api(self):
         pwd = self.password_var.get()
         if not pwd or pwd == "Generate to Begin":
@@ -329,20 +370,19 @@ class QuantumPassApp(ctk.CTk):
         try:
             res = requests.get(f"https://api.pwnedpasswords.com/range/{prefix}", timeout=5)
             if res.status_code != 200:
-                messagebox.showerror("Error", "Could not reach Pwned Passwords API.")
+                messagebox.showerror("Error", "Could not reach Pwned API.")
                 return
 
             hashes = (line.split(':') for line in res.text.splitlines())
             count = next((int(cnt) for h, cnt in hashes if h == suffix), 0)
 
             if count > 0:
-                messagebox.showwarning("Pwned Alert!", f"⚠️ Warning: Found in {count:,} known data breaches! Do NOT use this password.")
+                messagebox.showwarning("Pwned Alert!", f"⚠️ Warning: Found in {count:,} known data breaches!")
             else:
-                messagebox.showinfo("Safe", "✅ Good news: Zero matches found in known database breaches.")
+                messagebox.showinfo("Safe", "✅ Good news: Zero matches found in known breaches.")
         except Exception as e:
-            messagebox.showerror("API Error", f"Network connection failed: {e}")
+            messagebox.showerror("API Error", f"Network error: {e}")
 
-    # --- Feature 2: Mobile Transfer via QR Code ---
     def show_qr_code(self):
         pwd = self.password_var.get()
         if not pwd or pwd == "Generate to Begin":
@@ -355,7 +395,7 @@ class QuantumPassApp(ctk.CTk):
 
         if self.qr_window is None or not self.qr_window.winfo_exists():
             self.qr_window = ctk.CTkToplevel(self)
-            self.qr_window.title("Scan via Mobile")
+            self.qr_window.title("Mobile Scan")
             self.qr_window.geometry("260x280")
             self.qr_window.attributes("-topmost", True)
 
@@ -364,24 +404,33 @@ class QuantumPassApp(ctk.CTk):
         lbl.image = tk_img
         lbl.pack(pady=15, padx=15)
 
-    # --- Feature 3: Vault Mechanics ---
+    # --- Vault Actions, Filter & Health Audit ---
     def load_vault_entries(self):
         master_pwd = self.master_pwd_entry.get()
         if not master_pwd:
             messagebox.showwarning("Warning", "Enter master password.")
             return
         try:
-            data = QuantumVault.load_vault(master_pwd)
-            self.vault_list.configure(state="normal")
-            self.vault_list.delete("1.0", "end")
-            if not data:
-                self.vault_list.insert("end", "[Empty Vault]")
-            else:
-                for acc, secret in data.items():
-                    self.vault_list.insert("end", f"Service: {acc}\nPassword: {secret}\n" + "-"*35 + "\n")
-            self.vault_list.configure(state="disabled")
+            self.vault_cache = QuantumVault.load_vault(master_pwd)
+            self.vault_unlocked = True
+            self.filter_vault_display()
         except ValueError as err:
             messagebox.showerror("Vault Error", str(err))
+
+    def filter_vault_display(self, event=None):
+        if not self.vault_unlocked:
+            return
+        query = self.search_entry.get().lower()
+        self.vault_list.configure(state="normal")
+        self.vault_list.delete("1.0", "end")
+
+        if not self.vault_cache:
+            self.vault_list.insert("end", "[Vault Empty]")
+        else:
+            for acc, secret in self.vault_cache.items():
+                if query in acc.lower() or query in secret.lower():
+                    self.vault_list.insert("end", f"Service: {acc}\nPassword: {secret}\n" + "-"*35 + "\n")
+        self.vault_list.configure(state="disabled")
 
     def save_vault_entry(self):
         master_pwd = self.master_pwd_entry.get()
@@ -395,21 +444,81 @@ class QuantumPassApp(ctk.CTk):
             data = QuantumVault.load_vault(master_pwd) if os.path.exists(VAULT_FILE) else {}
             data[acc] = pwd
             QuantumVault.save_vault(master_pwd, data)
+            self.vault_cache = data
+            self.vault_unlocked = True
             messagebox.showinfo("Saved", f"Stored credentials for {acc}")
             self.vault_acc_entry.delete(0, "end")
             self.vault_pass_entry.delete(0, "end")
-            self.load_vault_entries()
+            self.filter_vault_display()
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
 
+    def run_vault_audit(self):
+        if not self.vault_unlocked or not self.vault_cache:
+            messagebox.showwarning("Audit", "Unlock a non-empty vault first.")
+            return
+
+        weak = []
+        reused = {}
+        for acc, pwd in self.vault_cache.items():
+            if len(pwd) < 10:
+                weak.append(acc)
+            reused[pwd] = reused.get(pwd, 0) + 1
+
+        reused_count = sum(1 for v in reused.values() if v > 1)
+        audit_msg = f"Vault Security Audit:\n\n"
+        audit_msg += f"• Total Accounts: {len(self.vault_cache)}\n"
+        audit_msg += f"• Weak Passwords (<10 chars): {len(weak)} ({', '.join(weak) if weak else 'None'})\n"
+        audit_msg += f"• Reused Passwords: {reused_count}\n\n"
+        audit_msg += "Status: " + ("🚨 Needs Improvement" if weak or reused_count else "🛡️ Excellent Security")
+
+        messagebox.showinfo("Security Audit Report", audit_msg)
+
     def lock_vault(self):
         self.master_pwd_entry.delete(0, "end")
+        self.vault_cache = {}
+        self.vault_unlocked = False
         self.vault_list.configure(state="normal")
         self.vault_list.delete("1.0", "end")
         self.vault_list.configure(state="disabled")
-        messagebox.showinfo("Locked", "Vault locked and cleared from memory.")
 
-    # --- Feature 4: Bulk CSV Export ---
+    # --- 2FA / TOTP Logic ---
+    def add_totp_key(self):
+        label = self.totp_name_entry.get().strip()
+        secret = self.totp_secret_entry.get().strip().replace(" ", "").upper()
+
+        if not label or not secret:
+            messagebox.showwarning("Warning", "Enter both account label and secret key.")
+            return
+        try:
+            totp = pyotp.TOTP(secret)
+            _ = totp.now()  # Validate key
+            self.totp_secrets[label] = secret
+            self.totp_name_entry.delete(0, "end")
+            self.totp_secret_entry.delete(0, "end")
+            self.render_totp()
+        except Exception:
+            messagebox.showerror("Invalid Key", "Invalid Base32 secret key.")
+
+    def render_totp(self):
+        self.totp_display.configure(state="normal")
+        self.totp_display.delete("1.0", "end")
+        if not self.totp_secrets:
+            self.totp_display.insert("end", "[No 2FA Accounts Added]")
+        else:
+            for label, sec in self.totp_secrets.items():
+                totp = pyotp.TOTP(sec)
+                code = totp.now()
+                remaining = 30 - (int(time.time()) % 30)
+                self.totp_display.insert("end", f"[{label}]\nCODE: {code[:3]} {code[3:]}  ({remaining}s remaining)\n" + "-"*35 + "\n")
+        self.totp_display.configure(state="disabled")
+
+    def update_totp_loop(self):
+        if self.totp_secrets:
+            self.render_totp()
+        self.after(1000, self.update_totp_loop)
+
+    # --- Bulk Export Tool ---
     def export_csv(self):
         count = int(self.bulk_count_slider.get())
         file_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
@@ -426,6 +535,7 @@ class QuantumPassApp(ctk.CTk):
                 writer.writerow([idx, p, 16, entropy])
 
         messagebox.showinfo("Export Successful", f"Saved {count} passwords to:\n{file_path}")
+
 
 if __name__ == "__main__":
     app = QuantumPassApp()

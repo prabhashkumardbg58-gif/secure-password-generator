@@ -3,3 +3,4 @@ requests
 cryptography
 qrcode
 pillow
+pyotp
