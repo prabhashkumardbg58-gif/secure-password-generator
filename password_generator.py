@@ -1,162 +1,262 @@
 import customtkinter as ctk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 import random
 import string
 import math
-import time
+import hashlib
+import requests
+import base64
+import os
+import json
+import csv
+import qrcode
+from PIL import ImageTk
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-# Word bank for passphrase mode
 WORD_BANK = [
     "quantum", "cyber", "falcon", "orbit", "matrix", "shield", "hyper", "neon", 
     "echo", "shadow", "titan", "plasma", "vortex", "stellar", "frost", "cipher",
     "binary", "crypto", "nexus", "aurora", "dynamo", "phantom", "pulse", "solar"
 ]
 
+VAULT_FILE = "vault.enc"
+VAULT_SALT_FILE = "vault.salt"
+
+class QuantumVault:
+    """Handles AES-256 encrypted storage using Fernet."""
+    @staticmethod
+    def _get_fernet_key(master_pwd: str, salt: bytes) -> bytes:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        return base64.urlsafe_b64encode(kdf.derive(master_pwd.encode()))
+
+    @classmethod
+    def load_vault(cls, master_pwd: str) -> dict:
+        if not os.path.exists(VAULT_FILE) or not os.path.exists(VAULT_SALT_FILE):
+            return {}
+        with open(VAULT_SALT_FILE, "rb") as f:
+            salt = f.read()
+        key = cls._get_fernet_key(master_pwd, salt)
+        fernet = Fernet(key)
+        try:
+            with open(VAULT_FILE, "rb") as f:
+                decrypted = fernet.decrypt(f.read())
+            return json.loads(decrypted.decode())
+        except Exception:
+            raise ValueError("Invalid Master Password or corrupted vault file.")
+
+    @classmethod
+    def save_vault(cls, master_pwd: str, data: dict):
+        if os.path.exists(VAULT_SALT_FILE):
+            with open(VAULT_SALT_FILE, "rb") as f:
+                salt = f.read()
+        else:
+            salt = os.urandom(16)
+            with open(VAULT_SALT_FILE, "wb") as f:
+                f.write(salt)
+
+        key = cls._get_fernet_key(master_pwd, salt)
+        fernet = Fernet(key)
+        encrypted = fernet.encrypt(json.dumps(data).encode())
+        with open(VAULT_FILE, "wb") as f:
+            f.write(encrypted)
+
+
 class QuantumPassApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("QUANTUM SECURE PASS - Pro Suite")
-        self.geometry("640x780")
+        self.title("QUANTUM SECURE PASS - Ultimate Edition")
+        self.geometry("740x840")
         self.resizable(False, False)
         self.configure(fg_color="#0b0f19")
 
         self.history = []
-        self.create_widgets()
+        self.qr_window = None
 
-    def create_widgets(self):
-        # Header
+        self.create_tabview()
+
+    def create_tabview(self):
+        self.tabs = ctk.CTkTabview(self, fg_color="#101622", segmented_button_selected_color="#6c5ce7")
+        self.tabs.pack(fill="both", expand=True, padx=15, pady=15)
+
+        self.tab_generator = self.tabs.add("Generator")
+        self.tab_vault = self.tabs.add("Encrypted Vault")
+        self.tab_bulk = self.tabs.add("Bulk Export")
+
+        self.setup_generator_ui()
+        self.setup_vault_ui()
+        self.setup_bulk_ui()
+
+    # --- Generator UI ---
+    def setup_generator_ui(self):
         self.header = ctk.CTkLabel(
-            self, text="⚡ QUANTUM SECURE PASS", 
-            font=ctk.CTkFont(family="Consolas", size=22, weight="bold"),
+            self.tab_generator, text="⚡ QUANTUM GENERATOR", 
+            font=ctk.CTkFont(family="Consolas", size=20, weight="bold"),
             text_color="#00f0ff"
         )
-        self.header.pack(pady=(18, 8))
+        self.header.pack(pady=(10, 6))
 
-        # Mode Selector
         self.mode_var = ctk.StringVar(value="Standard")
         self.mode_switch = ctk.CTkSegmentedButton(
-            self, values=["Standard", "Passphrase", "PIN"],
+            self.tab_generator, values=["Standard", "Passphrase", "PIN", "Pronounceable"],
             variable=self.mode_var, command=self.on_mode_change,
             selected_color="#6c5ce7", unselected_color="#161b22"
         )
-        self.mode_switch.pack(pady=6)
+        self.mode_switch.pack(pady=4)
 
-        # Output Card
-        self.display_frame = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=12, border_width=1, border_color="#30363d")
-        self.display_frame.pack(pady=10, padx=25, fill="x")
+        self.display_frame = ctk.CTkFrame(self.tab_generator, fg_color="#161b22", corner_radius=10)
+        self.display_frame.pack(pady=8, padx=20, fill="x")
 
         self.password_var = ctk.StringVar(value="Generate to Begin")
         self.password_entry = ctk.CTkEntry(
             self.display_frame, textvariable=self.password_var,
-            font=ctk.CTkFont(family="Consolas", size=17, weight="bold"),
+            font=ctk.CTkFont(family="Consolas", size=16, weight="bold"),
             text_color="#00f5d4", fg_color="transparent", border_width=0,
-            justify="center", height=45
+            justify="center", height=40
         )
-        self.password_entry.pack(pady=8, padx=10, fill="x")
+        self.password_entry.pack(pady=6, padx=10, fill="x")
 
-        # Telemetry Frame (Entropy & Crack Time)
-        self.stats_frame = ctk.CTkFrame(self, fg_color="#101622", corner_radius=10)
-        self.stats_frame.pack(pady=5, padx=25, fill="x")
+        self.stats_frame = ctk.CTkFrame(self.tab_generator, fg_color="#0b0f19", corner_radius=8)
+        self.stats_frame.pack(pady=2, padx=20, fill="x")
 
         self.entropy_label = ctk.CTkLabel(self.stats_frame, text="Entropy: 0 bits", font=ctk.CTkFont(size=11), text_color="#8b949e")
-        self.entropy_label.pack(side="left", padx=15, pady=6)
+        self.entropy_label.pack(side="left", padx=12, pady=4)
 
         self.crack_label = ctk.CTkLabel(self.stats_frame, text="Crack Time: -", font=ctk.CTkFont(size=11, weight="bold"), text_color="#ffa502")
-        self.crack_label.pack(side="right", padx=15, pady=6)
+        self.crack_label.pack(side="right", padx=12, pady=4)
 
-        # Main Generate Button
         self.generate_btn = ctk.CTkButton(
-            self, text="GENERATE PASSWORD", command=self.generate,
-            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
-            fg_color="#00e5ff", hover_color="#00b4d8", text_color="#050811",
-            corner_radius=20, height=42
+            self.tab_generator, text="GENERATE PASSWORD", command=self.generate,
+            font=ctk.CTkFont(size=13, weight="bold"), fg_color="#00e5ff", hover_color="#00b4d8",
+            text_color="#050811", corner_radius=15, height=38
         )
-        self.generate_btn.pack(pady=10, padx=25, fill="x")
+        self.generate_btn.pack(pady=8, padx=20, fill="x")
 
-        # Action Buttons
-        self.action_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.action_frame.pack(pady=4, padx=25, fill="x")
+        # Action Strip
+        self.btn_grid = ctk.CTkFrame(self.tab_generator, fg_color="transparent")
+        self.btn_grid.pack(pady=2, padx=20, fill="x")
 
-        self.copy_btn = ctk.CTkButton(
-            self.action_frame, text="📋 Copy (Auto-Clears in 30s)", command=self.copy_to_clipboard,
-            fg_color="#6c5ce7", hover_color="#5843be", height=35
-        )
-        self.copy_btn.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.copy_btn = ctk.CTkButton(self.btn_grid, text="📋 Copy", command=self.copy_to_clipboard, fg_color="#6c5ce7", width=120)
+        self.copy_btn.pack(side="left", padx=2, expand=True, fill="x")
 
-        # Controls Container
-        self.controls = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=12)
-        self.controls.pack(pady=8, padx=25, fill="x")
+        self.pwned_btn = ctk.CTkButton(self.btn_grid, text="🛡️ Breach Check", command=self.check_pwned_api, fg_color="#eb4d4b", width=120)
+        self.pwned_btn.pack(side="left", padx=2, expand=True, fill="x")
 
-        self.length_label = ctk.CTkLabel(self.controls, text="LENGTH: 16", font=ctk.CTkFont(family="Consolas", size=12, weight="bold"))
-        self.length_label.pack(pady=(8, 2))
+        self.qr_btn = ctk.CTkButton(self.btn_grid, text="📱 Show QR", command=self.show_qr_code, fg_color="#2ed573", text_color="#050811", width=120)
+        self.qr_btn.pack(side="left", padx=2, expand=True, fill="x")
+
+        # Controls
+        self.controls = ctk.CTkFrame(self.tab_generator, fg_color="#161b22", corner_radius=10)
+        self.controls.pack(pady=8, padx=20, fill="x")
+
+        self.length_label = ctk.CTkLabel(self.controls, text="LENGTH: 16", font=ctk.CTkFont(family="Consolas", size=11, weight="bold"))
+        self.length_label.pack(pady=(6, 0))
 
         self.length_slider = ctk.CTkSlider(self.controls, from_=4, to=48, number_of_steps=44, command=self.update_length_label)
         self.length_slider.set(16)
-        self.length_slider.pack(pady=(0, 8), padx=20, fill="x")
+        self.length_slider.pack(pady=4, padx=20, fill="x")
 
-        # Checkbox Options
         self.switches_frame = ctk.CTkFrame(self.controls, fg_color="transparent")
         self.switches_frame.pack(pady=4, padx=10, fill="x")
 
-        self.num_switch = ctk.CTkSwitch(self.switches_frame, text="Numbers (0-9)")
+        self.num_switch = ctk.CTkSwitch(self.switches_frame, text="Numbers")
         self.num_switch.select()
-        self.num_switch.grid(row=0, column=0, padx=10, pady=4, sticky="w")
+        self.num_switch.grid(row=0, column=0, padx=10, pady=2, sticky="w")
 
-        self.sym_switch = ctk.CTkSwitch(self.switches_frame, text="Symbols (!@#)")
+        self.sym_switch = ctk.CTkSwitch(self.switches_frame, text="Symbols")
         self.sym_switch.select()
-        self.sym_switch.grid(row=0, column=1, padx=10, pady=4, sticky="w")
+        self.sym_switch.grid(row=0, column=1, padx=10, pady=2, sticky="w")
 
-        self.upper_switch = ctk.CTkSwitch(self.switches_frame, text="Uppercase (A-Z)")
+        self.upper_switch = ctk.CTkSwitch(self.switches_frame, text="Uppercase")
         self.upper_switch.select()
-        self.upper_switch.grid(row=1, column=0, padx=10, pady=4, sticky="w")
+        self.upper_switch.grid(row=1, column=0, padx=10, pady=2, sticky="w")
 
-        self.ambig_switch = ctk.CTkSwitch(self.switches_frame, text="Exclude Ambiguous (0,O,l,1)")
-        self.ambig_switch.grid(row=1, column=1, padx=10, pady=4, sticky="w")
+        self.ambig_switch = ctk.CTkSwitch(self.switches_frame, text="No Ambiguous (0,O,l,1)")
+        self.ambig_switch.grid(row=1, column=1, padx=10, pady=2, sticky="w")
 
-        # Session History View
-        self.history_label = ctk.CTkLabel(self, text="Session History (Recent 4)", font=ctk.CTkFont(size=11, weight="bold"), text_color="#8b949e")
-        self.history_label.pack(pady=(6, 2))
-
-        self.history_box = ctk.CTkTextbox(self, height=70, fg_color="#101622", text_color="#a29bfe", font=ctk.CTkFont(family="Consolas", size=11))
-        self.history_box.pack(pady=2, padx=25, fill="x")
+        # Rolling Session History
+        self.history_box = ctk.CTkTextbox(self.tab_generator, height=60, fg_color="#0b0f19", text_color="#a29bfe", font=ctk.CTkFont(family="Consolas", size=11))
+        self.history_box.pack(pady=6, padx=20, fill="x")
         self.history_box.configure(state="disabled")
 
+    # --- Encrypted Vault UI ---
+    def setup_vault_ui(self):
+        self.master_pwd_entry = ctk.CTkEntry(self.tab_vault, placeholder_text="Master Vault Password", show="*", width=250)
+        self.master_pwd_entry.pack(pady=(15, 6))
+
+        self.vault_actions = ctk.CTkFrame(self.tab_vault, fg_color="transparent")
+        self.vault_actions.pack(pady=4)
+
+        ctk.CTkButton(self.vault_actions, text="Unlock / Load", command=self.load_vault_entries, fg_color="#6c5ce7").pack(side="left", padx=5)
+        ctk.CTkButton(self.vault_actions, text="Lock Vault", command=self.lock_vault, fg_color="#eb4d4b").pack(side="left", padx=5)
+
+        self.save_form = ctk.CTkFrame(self.tab_vault, fg_color="#161b22", corner_radius=10)
+        self.save_form.pack(pady=10, padx=20, fill="x")
+
+        self.vault_acc_entry = ctk.CTkEntry(self.save_form, placeholder_text="Account/Service (e.g., GitHub, Gmail)")
+        self.vault_acc_entry.pack(pady=4, padx=15, fill="x")
+
+        self.vault_pass_entry = ctk.CTkEntry(self.save_form, placeholder_text="Password to Store")
+        self.vault_pass_entry.pack(pady=4, padx=15, fill="x")
+
+        ctk.CTkButton(self.save_form, text="Save Entry to Vault", command=self.save_vault_entry, fg_color="#00e5ff", text_color="#050811").pack(pady=8)
+
+        self.vault_list = ctk.CTkTextbox(self.tab_vault, height=220, fg_color="#0b0f19", font=ctk.CTkFont(family="Consolas", size=12))
+        self.vault_list.pack(pady=8, padx=20, fill="both", expand=True)
+        self.vault_list.configure(state="disabled")
+
+    # --- Bulk Export UI ---
+    def setup_bulk_ui(self):
+        ctk.CTkLabel(self.tab_bulk, text="📦 Bulk Password Exporter", font=ctk.CTkFont(size=16, weight="bold"), text_color="#00f0ff").pack(pady=(20, 10))
+
+        self.bulk_count_slider = ctk.CTkSlider(self.tab_bulk, from_=10, to=200, number_of_steps=19, command=lambda v: self.bulk_count_lbl.configure(text=f"Batch Count: {int(v)}"))
+        self.bulk_count_slider.set(25)
+        self.bulk_count_slider.pack(pady=5, padx=40, fill="x")
+
+        self.bulk_count_lbl = ctk.CTkLabel(self.tab_bulk, text="Batch Count: 25", font=ctk.CTkFont(family="Consolas", size=12))
+        self.bulk_count_lbl.pack(pady=2)
+
+        ctk.CTkButton(self.tab_bulk, text="Generate & Export to CSV", command=self.export_csv, fg_color="#2ed573", text_color="#050811", height=40).pack(pady=20, padx=40, fill="x")
+
+    # --- Core Mechanics & Generator Logic ---
     def update_length_label(self, val):
-        self.length_label.configure(text=f"LENGTH: {int(val)}")
+        unit = "WORDS" if self.mode_var.get() == "Passphrase" else "LENGTH"
+        self.length_label.configure(text=f"{unit}: {int(val)}")
 
     def on_mode_change(self, mode):
         if mode == "Passphrase":
             self.length_slider.configure(from_=3, to=8, number_of_steps=5)
             self.length_slider.set(4)
-            self.length_label.configure(text="WORDS: 4")
         elif mode == "PIN":
             self.length_slider.configure(from_=4, to=12, number_of_steps=8)
             self.length_slider.set(6)
-            self.length_label.configure(text="LENGTH: 6")
         else:
             self.length_slider.configure(from_=4, to=48, number_of_steps=44)
             self.length_slider.set(16)
-            self.length_label.configure(text="LENGTH: 16")
+        self.update_length_label(self.length_slider.get())
 
     def calculate_telemetry(self, password, pool_size):
-        if not password or pool_size <= 0:
-            return
+        if not password or pool_size <= 0: return
         entropy = len(password) * math.log2(pool_size)
         self.entropy_label.configure(text=f"Entropy: {entropy:.1f} bits")
 
-        # Assuming 10 billion guesses/sec (modern GPU rig)
         seconds = (2 ** entropy) / 10_000_000_000
-
         if seconds < 1: crack_str = "Instant"
-        elif seconds < 60: crack_str = f"{int(seconds)} secs"
-        elif seconds < 3600: crack_str = f"{int(seconds/60)} mins"
-        elif seconds < 86400: crack_str = f"{int(seconds/3600)} hours"
-        elif seconds < 31536000: crack_str = f"{int(seconds/86400)} days"
-        elif seconds < 31536000 * 1000: crack_str = f"{int(seconds/31536000)} years"
+        elif seconds < 60: crack_str = f"{int(seconds)}s"
+        elif seconds < 3600: crack_str = f"{int(seconds/60)}m"
+        elif seconds < 86400: crack_str = f"{int(seconds/3600)}h"
+        elif seconds < 31536000: crack_str = f"{int(seconds/86400)}d"
+        elif seconds < 31536000 * 1000: crack_str = f"{int(seconds/31536000)}y"
         else: crack_str = "Centuries+"
 
         color = "#ff4757" if entropy < 45 else ("#ffa502" if entropy < 70 else "#2ed573")
@@ -169,26 +269,26 @@ class QuantumPassApp(ctk.CTk):
         pool_size = 0
 
         if mode == "Passphrase":
-            selected = random.choices(WORD_BANK, k=length)
-            password = "-".join(selected)
+            password = "-".join(random.choices(WORD_BANK, k=length))
             pool_size = len(WORD_BANK)
         elif mode == "PIN":
             password = "".join(random.choices(string.digits, k=length))
             pool_size = 10
+        elif mode == "Pronounceable":
+            vowels = "aeiou"
+            consonants = "bcdfghjklmnprstvwxyz"
+            password = "".join(random.choice(consonants) + random.choice(vowels) for _ in range(length // 2))
+            pool_size = len(vowels) * len(consonants)
         else:
             pool = string.ascii_lowercase
             if self.upper_switch.get(): pool += string.ascii_uppercase
             if self.num_switch.get(): pool += string.digits
             if self.sym_switch.get(): pool += "!@#$%^&*()_+-=[]{}|;:,.<>?"
-
             if self.ambig_switch.get():
-                for char in "0Ol1I|":
-                    pool = pool.replace(char, "")
-
+                for char in "0Ol1I|": pool = pool.replace(char, "")
             if not pool:
                 messagebox.showwarning("Warning", "Select at least one character type.")
                 return
-
             password = "".join(random.choices(pool, k=length))
             pool_size = len(pool)
 
@@ -209,12 +309,123 @@ class QuantumPassApp(ctk.CTk):
         if pwd and pwd not in ["Generate to Begin", ""]:
             self.clipboard_clear()
             self.clipboard_append(pwd)
-            self.copy_btn.configure(text="✅ Copied! (Clearing in 30s)")
+            self.copy_btn.configure(text="✅ Copied (30s)")
             self.after(30000, self.auto_clear_clipboard)
 
     def auto_clear_clipboard(self):
         self.clipboard_clear()
-        self.copy_btn.configure(text="📋 Copy (Auto-Clears in 30s)")
+        self.copy_btn.configure(text="📋 Copy")
+
+    # --- Feature 1: HaveIBeenPwned API (k-Anonymity) ---
+    def check_pwned_api(self):
+        pwd = self.password_var.get()
+        if not pwd or pwd == "Generate to Begin":
+            messagebox.showwarning("Warning", "Generate or enter a password first.")
+            return
+
+        sha1_hash = hashlib.sha1(pwd.encode('utf-8')).hexdigest().upper()
+        prefix, suffix = sha1_hash[:5], sha1_hash[5:]
+
+        try:
+            res = requests.get(f"https://api.pwnedpasswords.com/range/{prefix}", timeout=5)
+            if res.status_code != 200:
+                messagebox.showerror("Error", "Could not reach Pwned Passwords API.")
+                return
+
+            hashes = (line.split(':') for line in res.text.splitlines())
+            count = next((int(cnt) for h, cnt in hashes if h == suffix), 0)
+
+            if count > 0:
+                messagebox.showwarning("Pwned Alert!", f"⚠️ Warning: Found in {count:,} known data breaches! Do NOT use this password.")
+            else:
+                messagebox.showinfo("Safe", "✅ Good news: Zero matches found in known database breaches.")
+        except Exception as e:
+            messagebox.showerror("API Error", f"Network connection failed: {e}")
+
+    # --- Feature 2: Mobile Transfer via QR Code ---
+    def show_qr_code(self):
+        pwd = self.password_var.get()
+        if not pwd or pwd == "Generate to Begin":
+            return
+
+        qr = qrcode.QRCode(box_size=6, border=2)
+        qr.add_data(pwd)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+
+        if self.qr_window is None or not self.qr_window.winfo_exists():
+            self.qr_window = ctk.CTkToplevel(self)
+            self.qr_window.title("Scan via Mobile")
+            self.qr_window.geometry("260x280")
+            self.qr_window.attributes("-topmost", True)
+
+        tk_img = ImageTk.PhotoImage(img)
+        lbl = ctk.CTkLabel(self.qr_window, image=tk_img, text="")
+        lbl.image = tk_img
+        lbl.pack(pady=15, padx=15)
+
+    # --- Feature 3: Vault Mechanics ---
+    def load_vault_entries(self):
+        master_pwd = self.master_pwd_entry.get()
+        if not master_pwd:
+            messagebox.showwarning("Warning", "Enter master password.")
+            return
+        try:
+            data = QuantumVault.load_vault(master_pwd)
+            self.vault_list.configure(state="normal")
+            self.vault_list.delete("1.0", "end")
+            if not data:
+                self.vault_list.insert("end", "[Empty Vault]")
+            else:
+                for acc, secret in data.items():
+                    self.vault_list.insert("end", f"Service: {acc}\nPassword: {secret}\n" + "-"*35 + "\n")
+            self.vault_list.configure(state="disabled")
+        except ValueError as err:
+            messagebox.showerror("Vault Error", str(err))
+
+    def save_vault_entry(self):
+        master_pwd = self.master_pwd_entry.get()
+        acc = self.vault_acc_entry.get()
+        pwd = self.vault_pass_entry.get() or self.password_var.get()
+
+        if not master_pwd or not acc or not pwd:
+            messagebox.showwarning("Warning", "Fill Master Password, Account, and Password fields.")
+            return
+        try:
+            data = QuantumVault.load_vault(master_pwd) if os.path.exists(VAULT_FILE) else {}
+            data[acc] = pwd
+            QuantumVault.save_vault(master_pwd, data)
+            messagebox.showinfo("Saved", f"Stored credentials for {acc}")
+            self.vault_acc_entry.delete(0, "end")
+            self.vault_pass_entry.delete(0, "end")
+            self.load_vault_entries()
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    def lock_vault(self):
+        self.master_pwd_entry.delete(0, "end")
+        self.vault_list.configure(state="normal")
+        self.vault_list.delete("1.0", "end")
+        self.vault_list.configure(state="disabled")
+        messagebox.showinfo("Locked", "Vault locked and cleared from memory.")
+
+    # --- Feature 4: Bulk CSV Export ---
+    def export_csv(self):
+        count = int(self.bulk_count_slider.get())
+        file_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        if not file_path:
+            return
+
+        pool = string.ascii_letters + string.digits + "!@#$%^&*"
+        with open(file_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Index", "Generated Password", "Length", "Entropy (bits)"])
+            for idx in range(1, count + 1):
+                p = "".join(random.choices(pool, k=16))
+                entropy = round(16 * math.log2(len(pool)), 2)
+                writer.writerow([idx, p, 16, entropy])
+
+        messagebox.showinfo("Export Successful", f"Saved {count} passwords to:\n{file_path}")
 
 if __name__ == "__main__":
     app = QuantumPassApp()
